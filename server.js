@@ -162,11 +162,14 @@ async function generateWithNiniJoker(req, res, opts) {
   });
 
   const imageResponse = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      Accept: 'image/png,image/jpeg,image/webp,*/*',
-    },
-  });
+  method: 'GET',
+  headers: {
+    Accept: 'image/png,image/jpeg,image/webp,*/*',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    Referer: 'https://qq.soso130.xyz/',
+  },
+});
 
   if (!imageResponse.ok) {
     const text = await imageResponse.text().catch(() => '');
