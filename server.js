@@ -21,6 +21,16 @@ app.get('/', (req, res) => {
   res.send('DF NovelAI 后端运行中');
 });
 
+async function saveImageBuffer(buffer, ext, req) {
+  const filename = `df_${Date.now()}_${Math.floor(Math.random() * 100000)}.${ext}`;
+  const filepath = path.join(OUTPUT_DIR, filename);
+
+  fs.writeFileSync(filepath, buffer);
+
+  const origin = `${req.protocol}://${req.get('host')}`;
+  return `${origin}/generated/${filename}`;
+}
+
 async function extractImageUrlFromZip(buffer, req) {
   const directory = await unzipper.Open.buffer(buffer);
 
@@ -34,28 +44,20 @@ async function extractImageUrlFromZip(buffer, req) {
 
   const imageBuffer = await imageFile.buffer();
 
-  const ext = imageFile.path.toLowerCase().endsWith('.webp')
+  const lowerPath = imageFile.path.toLowerCase();
+
+  const ext = lowerPath.endsWith('.webp')
     ? 'webp'
-    : imageFile.path.toLowerCase().endsWith('.jpg') || imageFile.path.toLowerCase().endsWith('.jpeg')
+    : lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')
       ? 'jpg'
       : 'png';
 
-  const filename = `df_${Date.now()}_${Math.floor(Math.random() * 100000)}.${ext}`;
-  const filepath = path.join(OUTPUT_DIR, filename);
-
-  fs.writeFileSync(filepath, imageBuffer);
-
-  const origin = `${req.protocol}://${req.get('host')}`;
-  return `${origin}/generated/${filename}`;
+  return saveImageBuffer(imageBuffer, ext, req);
 }
 
 function isV4Model(model) {
   const m = String(model || '').toLowerCase();
-
-  return (
-    m.includes('nai-diffusion-4') ||
-    m.includes('nai-diffusion-4-5')
-  );
+  return m.includes('nai-diffusion-4') || m.includes('nai-diffusion-4-5');
 }
 
 function buildFinalPrompt({
@@ -65,16 +67,13 @@ function buildFinalPrompt({
   customStyle = '',
   extraPrompt = '',
 }) {
-  const finalStyle =
-    style === 'custom'
-      ? customStyle
-      : style;
+  const styleText = customStyle || style;
 
   return [
+    extraPrompt,
     prompt,
     imageDescription,
-    extraPrompt,
-    finalStyle ? `${finalStyle} style` : '',
+    styleText ? `${styleText} style` : '',
   ]
     .filter(Boolean)
     .join(', ');
@@ -91,49 +90,36 @@ function buildNegativePrompt(negativePrompt = '') {
   ].join(', ');
 }
 
-function normalizeUpstreamEndpoint(url = '') {
+function normalizeNiniEndpoint(url) {
   const clean = String(url || '').trim().replace(/\/+$/, '');
 
   if (!clean) {
-    throw new Error('缺少 upstreamEndpoint。请在 DF设置 里填写上游接口地址。');
+    throw new Error('缺少 upstreamEndpoint。请填写第三方接口地址。');
   }
 
-  if (clean.includes('/v1/images/generations')) {
+  if (clean.endsWith('/generate')) {
     return clean;
   }
 
-  return `${clean}/v1/images/generations`;
+  return `${clean}/generate`;
 }
 
-function getImageSizeFromModel(model = '') {
-  const m = String(model || '').toLowerCase();
-
-  if (m.includes('dall-e-3')) {
-    return '1024x1792';
-  }
-
-  return '1024x1536';
-}
-
-async function generateWithCustomApi(req, res, opts) {
+async function generateWithNiniJoker(req, res, opts) {
   const {
-    prompt = '',
-    imageDescription = '',
-    style = 'anime',
-    customStyle = '',
-    model = 'gpt-image-1',
-    upstreamEndpoint = '',
-    upstreamKey = '',
-    extraPrompt = '',
-    negativePrompt = '',
-    character = '',
-    handle = '',
-    tweet = '',
+    prompt,
+    imageDescription,
+    style,
+    customStyle,
+    model,
+    upstreamEndpoint,
+    upstreamKey,
+    extraPrompt,
+    negativePrompt,
   } = opts;
 
   if (!upstreamKey) {
     return res.status(400).json({
-      error: '缺少 upstreamKey。provider=custom 时，请在 DF设置 里填写上游 API Key。',
+      error: '缺少 upstreamKey。请在 DF设置 里填写第三方 API Key。',
     });
   }
 
@@ -142,8 +128,6 @@ async function generateWithCustomApi(req, res, opts) {
       error: '缺少 prompt。',
     });
   }
-
-  const finalEndpoint = normalizeUpstreamEndpoint(upstreamEndpoint);
 
   const finalPrompt = buildFinalPrompt({
     prompt,
@@ -155,79 +139,71 @@ async function generateWithCustomApi(req, res, opts) {
 
   const finalNegativePrompt = buildNegativePrompt(negativePrompt);
 
-  console.log('收到 custom 生图请求：');
+  const endpoint = normalizeNiniEndpoint(upstreamEndpoint);
+
+  const url = new URL(endpoint);
+
+  url.searchParams.set('token', upstreamKey);
+  url.searchParams.set('model', model || 'nai-diffusion-4-5-full');
+  url.searchParams.set('size', '832x1216');
+  url.searchParams.set('steps', '28');
+  url.searchParams.set('scale', '5.0');
+  url.searchParams.set('cfg', '0');
+  url.searchParams.set('sampler', 'k_euler_ancestral');
+  url.searchParams.set('negative', finalNegativePrompt);
+  url.searchParams.set('tag', finalPrompt);
+
+  console.log('收到 NiniJoker 生图请求：');
   console.log({
-    provider: 'custom',
-    upstreamEndpoint: finalEndpoint,
-    model,
-    style,
+    endpoint,
+    model: model || 'nai-diffusion-4-5-full',
     prompt: finalPrompt,
     negativePrompt: finalNegativePrompt,
-    character,
-    handle,
-    tweet,
   });
 
-  const body = {
-    model,
-    prompt: finalPrompt,
-    n: 1,
-    size: getImageSizeFromModel(model),
-  };
-
-  const customResponse = await fetch(finalEndpoint, {
-    method: 'POST',
+  const imageResponse = await fetch(url.toString(), {
+    method: 'GET',
     headers: {
-      Authorization: `Bearer ${upstreamKey}`,
-      'Content-Type': 'application/json',
+      Accept: 'image/png,image/jpeg,image/webp,*/*',
     },
-    body: JSON.stringify(body),
   });
 
-  const contentType = customResponse.headers.get('content-type') || '';
+  if (!imageResponse.ok) {
+    const text = await imageResponse.text().catch(() => '');
 
-  if (!customResponse.ok) {
-    const text = await customResponse.text().catch(() => '');
+    console.error('NiniJoker 返回错误：', imageResponse.status, text);
 
-    console.error('Custom API 返回错误：', customResponse.status, text);
-
-    return res.status(customResponse.status).json({
-      error: `Custom API 生成失败：${customResponse.status}`,
-      detail: text.slice(0, 1000),
-      upstreamEndpoint: finalEndpoint,
-      model,
+    return res.status(imageResponse.status).json({
+      error:
+        imageResponse.status === 401 || imageResponse.status === 403
+          ? '401/403：Key 无效或权限不足。检查 upstreamKey。'
+          : `NiniJoker 生成失败：${imageResponse.status}`,
+      detail: text.slice(0, 500),
     });
   }
 
+  const contentType = imageResponse.headers.get('content-type') || '';
+
   if (contentType.includes('application/json')) {
-    const data = await customResponse.json();
+    const data = await imageResponse.json();
 
     const imageUrl =
       data.imageUrl ||
       data.image_url ||
       data.url ||
-      data.output?.[0] ||
       data.data?.[0]?.url ||
       '';
 
-    let base64 =
+    const base64 =
       data.base64 ||
       data.image ||
-      data.b64_json ||
       data.data?.[0]?.b64_json ||
       '';
 
-    if (base64 && base64.startsWith('data:image')) {
-      base64 = base64.replace(/^data:image\/\w+;base64,/, '');
-    }
-
     if (!imageUrl && !base64) {
-      console.error('Custom API 返回格式无法识别：', data);
-
       return res.status(500).json({
-        error: 'Custom API 没有返回可识别图片字段。',
-        detail: JSON.stringify(data).slice(0, 1000),
-        expected: '支持 imageUrl / image_url / url / output[0] / base64 / image / b64_json / data[0].url / data[0].b64_json',
+        error: 'NiniJoker 返回了 JSON，但没有 imageUrl / base64 / url。',
+        detail: JSON.stringify(data).slice(0, 500),
       });
     }
 
@@ -239,12 +215,23 @@ async function generateWithCustomApi(req, res, opts) {
     });
   }
 
-  const buffer = Buffer.from(await customResponse.arrayBuffer());
-  const base64 = buffer.toString('base64');
+  const arrayBuffer = await imageResponse.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  let ext = 'png';
+
+  if (contentType.includes('jpeg') || contentType.includes('jpg')) {
+    ext = 'jpg';
+  }
+
+  if (contentType.includes('webp')) {
+    ext = 'webp';
+  }
+
+  const imageUrl = await saveImageBuffer(buffer, ext, req);
 
   return res.json({
-    imageUrl: '',
-    base64,
+    imageUrl,
     model,
     provider: 'custom',
   });
@@ -254,6 +241,7 @@ async function generateWithNovelAI(req, res, opts) {
   const {
     prompt = '',
     imageDescription = '',
+    tweet = '',
     style = 'anime',
     customStyle = '',
     model = 'nai-diffusion-3',
@@ -262,12 +250,11 @@ async function generateWithNovelAI(req, res, opts) {
     negativePrompt = '',
     character = '',
     handle = '',
-    tweet = '',
   } = opts;
 
   if (!token) {
     return res.status(400).json({
-      error: '缺少 NovelAI Token。provider=novelai 时，请在 DF设置 里填写 token。',
+      error: '缺少 NovelAI Token。请在 DF设置 里填写 token。',
     });
   }
 
@@ -350,9 +337,8 @@ async function generateWithNovelAI(req, res, opts) {
         negative_prompt: finalNegativePrompt,
       };
 
-  console.log('收到 NovelAI 官方生图请求：');
+  console.log('收到 NovelAI 生图请求：');
   console.log({
-    provider: 'novelai',
     model,
     style,
     useV4,
@@ -386,7 +372,7 @@ async function generateWithNovelAI(req, res, opts) {
 
     return res.status(naiResponse.status).json({
       error: `NovelAI 生成失败：${naiResponse.status}`,
-      detail: text.slice(0, 1000),
+      detail: text.slice(0, 500),
     });
   }
 
@@ -406,38 +392,29 @@ async function generateWithNovelAI(req, res, opts) {
 app.post('/api/novelai-generate', async (req, res) => {
   try {
     const {
+      provider = 'novelai',
+
       prompt = '',
       imageDescription = '',
       tweet = '',
 
-      provider = 'novelai',
-      upstreamEndpoint = '',
-      upstreamKey = '',
-
       style = 'anime',
       customStyle = '',
       model = 'nai-diffusion-3',
+
       token = '',
+      upstreamEndpoint = '',
+      upstreamKey = '',
+
       extraPrompt = '',
       negativePrompt = '',
+
       character = '',
       handle = '',
     } = req.body || {};
 
-    console.log('收到 /api/novelai-generate 请求：');
-    console.log({
-      provider,
-      upstreamEndpoint: upstreamEndpoint ? '[已填写]' : '[未填写]',
-      upstreamKey: upstreamKey ? '[已填写]' : '[未填写]',
-      token: token ? '[已填写]' : '[未填写]',
-      model,
-      style,
-      character,
-      handle,
-    });
-
     if (provider === 'custom') {
-      return await generateWithCustomApi(req, res, {
+      return await generateWithNiniJoker(req, res, {
         prompt,
         imageDescription,
         tweet,
