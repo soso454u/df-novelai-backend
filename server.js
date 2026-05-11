@@ -77,7 +77,6 @@ async function extractImageUrlFromZip(buffer, req) {
   }
 
   const imageBuffer = await imageFile.buffer();
-
   const lowerPath = imageFile.path.toLowerCase();
 
   const ext = lowerPath.endsWith('.webp')
@@ -138,12 +137,45 @@ function normalizeNiniEndpoint(url) {
   return `${clean}/generate`;
 }
 
+function normalizeOpenAIEndpoint(url) {
+  const clean = String(url || '').trim().replace(/\/+$/, '');
+
+  if (!clean) {
+    throw new Error('缺少 upstreamEndpoint。请填写 OpenAI 格式接口地址。');
+  }
+
+  if (clean.endsWith('/images/generations')) {
+    return clean;
+  }
+
+  if (clean.endsWith('/v1')) {
+    return `${clean}/images/generations`;
+  }
+
+  return `${clean}/v1/images/generations`;
+}
+
+function normalizeOpenAIModelsEndpoint(url) {
+  const clean = String(url || '').trim().replace(/\/+$/, '');
+
+  if (!clean) {
+    throw new Error('缺少 upstreamEndpoint。请填写 OpenAI 格式接口地址。');
+  }
+
+  if (clean.endsWith('/images/generations')) {
+    return clean.replace('/images/generations', '/models');
+  }
+
+  if (clean.endsWith('/v1')) {
+    return `${clean}/models`;
+  }
+
+  return `${clean}/v1/models`;
+}
+
 /**
- * NiniJoker / 第三方中转
- *
- * 注意：
- * 这里不再 fetch 图片。
- * 只拼出图片 URL，然后返回一个本后端的 redirect URL 给前端。
+ * custom = NiniJoker / generate 链接式接口
+ * 这里不 fetch 图片，只返回 redirect URL。
  */
 async function generateWithNiniJoker(req, res, opts) {
   const {
@@ -156,6 +188,12 @@ async function generateWithNiniJoker(req, res, opts) {
     upstreamKey = '',
     extraPrompt = '',
     negativePrompt = '',
+
+    niniSize = '832x1216',
+    niniSteps = '28',
+    niniScale = '5.0',
+    niniCfg = '0',
+    niniSampler = 'k_euler_ancestral',
   } = opts;
 
   if (!upstreamKey) {
@@ -185,11 +223,11 @@ async function generateWithNiniJoker(req, res, opts) {
 
   url.searchParams.set('token', upstreamKey);
   url.searchParams.set('model', model || 'nai-diffusion-4-5-full');
-  url.searchParams.set('size', '832x1216');
-  url.searchParams.set('steps', '28');
-  url.searchParams.set('scale', '5.0');
-  url.searchParams.set('cfg', '0');
-  url.searchParams.set('sampler', 'k_euler_ancestral');
+  url.searchParams.set('size', niniSize || '832x1216');
+  url.searchParams.set('steps', String(niniSteps || '28'));
+  url.searchParams.set('scale', String(niniScale || '5.0'));
+  url.searchParams.set('cfg', String(niniCfg || '0'));
+  url.searchParams.set('sampler', niniSampler || 'k_euler_ancestral');
   url.searchParams.set('negative', finalNegativePrompt);
   url.searchParams.set('tag', finalPrompt);
 
@@ -197,6 +235,11 @@ async function generateWithNiniJoker(req, res, opts) {
   console.log({
     endpoint,
     model: model || 'nai-diffusion-4-5-full',
+    size: niniSize,
+    steps: niniSteps,
+    scale: niniScale,
+    cfg: niniCfg,
+    sampler: niniSampler,
     prompt: finalPrompt,
     negativePrompt: finalNegativePrompt,
     mode: 'browser_redirect',
@@ -209,6 +252,147 @@ async function generateWithNiniJoker(req, res, opts) {
     model: model || 'nai-diffusion-4-5-full',
     provider: 'custom',
     mode: 'browser_redirect',
+  });
+}
+
+/**
+ * openai = OpenAI 格式第三方接口
+ * 常见请求：
+ * POST /v1/images/generations
+ * Authorization: Bearer xxx
+ */
+async function generateWithOpenAICompatible(req, res, opts) {
+  const {
+    prompt = '',
+    imageDescription = '',
+    style = 'anime',
+    customStyle = '',
+    model = 'gpt-image-1',
+    upstreamEndpoint = '',
+    upstreamKey = '',
+    extraPrompt = '',
+    negativePrompt = '',
+
+    openaiSize = '1024x1536',
+    openaiQuality = 'auto',
+    openaiN = 1,
+  } = opts;
+
+  if (!upstreamKey) {
+    return res.status(400).json({
+      error: '缺少 upstreamKey。请在 DF设置 里填写 OpenAI 格式接口 Key。',
+    });
+  }
+
+  if (!prompt) {
+    return res.status(400).json({
+      error: '缺少 prompt。',
+    });
+  }
+
+  const finalPrompt = buildFinalPrompt({
+    prompt,
+    imageDescription,
+    style,
+    customStyle,
+    extraPrompt,
+  });
+
+  const endpoint = normalizeOpenAIEndpoint(upstreamEndpoint);
+
+  console.log('收到 OpenAI 格式生图请求：');
+  console.log({
+    endpoint,
+    model,
+    size: openaiSize,
+    quality: openaiQuality,
+    n: openaiN,
+    prompt: finalPrompt,
+    negativePrompt,
+  });
+
+  const body = {
+    model: model || 'gpt-image-1',
+    prompt: finalPrompt,
+    n: Number(openaiN) || 1,
+    size: openaiSize || '1024x1536',
+  };
+
+  /**
+   * 不是所有第三方都支持 quality。
+   * 但 gpt-image-1 / dall-e-3 常见会支持。
+   */
+  if (openaiQuality && openaiQuality !== 'none') {
+    body.quality = openaiQuality;
+  }
+
+  /**
+   * OpenAI 官方 images/generations 没有 negative_prompt 标准字段。
+   * 有些第三方支持，所以这里用扩展字段传过去。
+   * 不支持的接口可能会报 400，到时候把 negativePrompt 清空即可。
+   */
+  if (negativePrompt) {
+    body.negative_prompt = negativePrompt;
+  }
+
+  const apiResponse = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${upstreamKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await apiResponse.text();
+
+  if (!apiResponse.ok) {
+    console.error('OpenAI 格式接口返回错误：', apiResponse.status, text);
+
+    return res.status(apiResponse.status).json({
+      error: `OpenAI 格式接口生成失败：${apiResponse.status}`,
+      detail: text.slice(0, 800),
+    });
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return res.status(500).json({
+      error: 'OpenAI 格式接口没有返回 JSON。',
+      detail: text.slice(0, 800),
+    });
+  }
+
+  const imageUrl =
+    data.imageUrl ||
+    data.image_url ||
+    data.url ||
+    data.data?.[0]?.url ||
+    '';
+
+  const base64 =
+    data.base64 ||
+    data.image ||
+    data.b64_json ||
+    data.data?.[0]?.b64_json ||
+    '';
+
+  if (!imageUrl && !base64) {
+    return res.status(500).json({
+      error: 'OpenAI 格式接口没有返回 imageUrl / base64 / data[0].url / data[0].b64_json。',
+      detail: JSON.stringify(data).slice(0, 800),
+    });
+  }
+
+  return res.json({
+    imageUrl,
+    base64,
+    model,
+    provider: 'openai',
   });
 }
 
@@ -364,6 +548,93 @@ async function generateWithNovelAI(req, res, opts) {
   });
 }
 
+/**
+ * 拉取模型列表
+ * provider=openai 时会请求 /v1/models
+ * provider=custom / novelai 返回内置候选。
+ */
+app.post('/api/models', async (req, res) => {
+  try {
+    const {
+      provider = 'custom',
+      upstreamEndpoint = '',
+      upstreamKey = '',
+    } = req.body || {};
+
+    if (provider === 'openai') {
+      if (!upstreamKey) {
+        return res.status(400).json({
+          error: '缺少 upstreamKey。',
+        });
+      }
+
+      const modelsEndpoint = normalizeOpenAIModelsEndpoint(upstreamEndpoint);
+
+      const modelResponse = await fetch(modelsEndpoint, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${upstreamKey}`,
+          Accept: 'application/json',
+        },
+      });
+
+      const text = await modelResponse.text();
+
+      if (!modelResponse.ok) {
+        return res.status(modelResponse.status).json({
+          error: `拉取模型失败：${modelResponse.status}`,
+          detail: text.slice(0, 800),
+        });
+      }
+
+      let data;
+
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return res.status(500).json({
+          error: '模型接口没有返回 JSON。',
+          detail: text.slice(0, 800),
+        });
+      }
+
+      const models = Array.isArray(data.data)
+        ? data.data
+            .map(item => item.id || item.name)
+            .filter(Boolean)
+        : [];
+
+      return res.json({
+        provider,
+        models,
+      });
+    }
+
+    if (provider === 'custom' || provider === 'novelai') {
+      return res.json({
+        provider,
+        models: [
+          'nai-diffusion-4-5-full',
+          'nai-diffusion-4-full',
+          'nai-diffusion-4-curated-preview',
+          'nai-diffusion-3',
+        ],
+      });
+    }
+
+    return res.json({
+      provider,
+      models: [],
+    });
+  } catch (err) {
+    console.error('拉取模型失败：', err);
+
+    return res.status(500).json({
+      error: err.message || '拉取模型失败',
+    });
+  }
+});
+
 app.post('/api/novelai-generate', async (req, res) => {
   try {
     const {
@@ -386,12 +657,20 @@ app.post('/api/novelai-generate', async (req, res) => {
 
       character = '',
       handle = '',
+
+      niniSize = '832x1216',
+      niniSteps = '28',
+      niniScale = '5.0',
+      niniCfg = '0',
+      niniSampler = 'k_euler_ancestral',
+
+      openaiSize = '1024x1536',
+      openaiQuality = 'auto',
+      openaiN = 1,
     } = req.body || {};
 
     /**
-     * 重点：
      * custom 必须在检查 NovelAI token 前分流。
-     * 否则 provider=custom 时也会报“缺少 NovelAI Token”。
      */
     if (provider === 'custom') {
       return await generateWithNiniJoker(req, res, {
@@ -407,6 +686,33 @@ app.post('/api/novelai-generate', async (req, res) => {
         negativePrompt,
         character,
         handle,
+
+        niniSize,
+        niniSteps,
+        niniScale,
+        niniCfg,
+        niniSampler,
+      });
+    }
+
+    if (provider === 'openai') {
+      return await generateWithOpenAICompatible(req, res, {
+        prompt,
+        imageDescription,
+        tweet,
+        style,
+        customStyle,
+        model,
+        upstreamEndpoint,
+        upstreamKey,
+        extraPrompt,
+        negativePrompt,
+        character,
+        handle,
+
+        openaiSize,
+        openaiQuality,
+        openaiN,
       });
     }
 
