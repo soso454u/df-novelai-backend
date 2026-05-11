@@ -17,6 +17,40 @@ if (!fs.existsSync(OUTPUT_DIR)) {
 
 app.use('/generated', express.static(OUTPUT_DIR));
 
+/**
+ * NiniJoker 浏览器跳转缓存
+ * 作用：
+ * 后端不直接 fetch 第三方图片，避免 Railway 服务器请求被拦。
+ * 前端拿到 /api/ninijoker-image/:id 后，由浏览器自己加载图片。
+ */
+const NINI_REDIRECT_CACHE = new Map();
+
+function createNiniRedirectUrl(realUrl, req) {
+  const id = `nini_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  NINI_REDIRECT_CACHE.set(id, {
+    url: realUrl,
+    createdAt: Date.now(),
+  });
+
+  setTimeout(() => {
+    NINI_REDIRECT_CACHE.delete(id);
+  }, 10 * 60 * 1000);
+
+  const origin = `${req.protocol}://${req.get('host')}`;
+  return `${origin}/api/ninijoker-image/${id}`;
+}
+
+app.get('/api/ninijoker-image/:id', (req, res) => {
+  const item = NINI_REDIRECT_CACHE.get(req.params.id);
+
+  if (!item) {
+    return res.status(404).send('图片链接已过期，请重新生成');
+  }
+
+  return res.redirect(302, item.url);
+});
+
 app.get('/', (req, res) => {
   res.send('DF NovelAI 后端运行中');
 });
@@ -104,17 +138,24 @@ function normalizeNiniEndpoint(url) {
   return `${clean}/generate`;
 }
 
+/**
+ * NiniJoker / 第三方中转
+ *
+ * 注意：
+ * 这里不再 fetch 图片。
+ * 只拼出图片 URL，然后返回一个本后端的 redirect URL 给前端。
+ */
 async function generateWithNiniJoker(req, res, opts) {
   const {
-    prompt,
-    imageDescription,
-    style,
-    customStyle,
-    model,
-    upstreamEndpoint,
-    upstreamKey,
-    extraPrompt,
-    negativePrompt,
+    prompt = '',
+    imageDescription = '',
+    style = 'anime',
+    customStyle = '',
+    model = 'nai-diffusion-4-5-full',
+    upstreamEndpoint = '',
+    upstreamKey = '',
+    extraPrompt = '',
+    negativePrompt = '',
   } = opts;
 
   if (!upstreamKey) {
@@ -140,7 +181,6 @@ async function generateWithNiniJoker(req, res, opts) {
   const finalNegativePrompt = buildNegativePrompt(negativePrompt);
 
   const endpoint = normalizeNiniEndpoint(upstreamEndpoint);
-
   const url = new URL(endpoint);
 
   url.searchParams.set('token', upstreamKey);
@@ -159,84 +199,16 @@ async function generateWithNiniJoker(req, res, opts) {
     model: model || 'nai-diffusion-4-5-full',
     prompt: finalPrompt,
     negativePrompt: finalNegativePrompt,
+    mode: 'browser_redirect',
   });
 
-  const imageResponse = await fetch(url.toString(), {
-  method: 'GET',
-  headers: {
-    Accept: 'image/png,image/jpeg,image/webp,*/*',
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    Referer: 'https://qq.soso130.xyz/',
-  },
-});
-
-  if (!imageResponse.ok) {
-    const text = await imageResponse.text().catch(() => '');
-
-    console.error('NiniJoker 返回错误：', imageResponse.status, text);
-
-    return res.status(imageResponse.status).json({
-      error:
-        imageResponse.status === 401 || imageResponse.status === 403
-          ? '401/403：Key 无效或权限不足。检查 upstreamKey。'
-          : `NiniJoker 生成失败：${imageResponse.status}`,
-      detail: text.slice(0, 500),
-    });
-  }
-
-  const contentType = imageResponse.headers.get('content-type') || '';
-
-  if (contentType.includes('application/json')) {
-    const data = await imageResponse.json();
-
-    const imageUrl =
-      data.imageUrl ||
-      data.image_url ||
-      data.url ||
-      data.data?.[0]?.url ||
-      '';
-
-    const base64 =
-      data.base64 ||
-      data.image ||
-      data.data?.[0]?.b64_json ||
-      '';
-
-    if (!imageUrl && !base64) {
-      return res.status(500).json({
-        error: 'NiniJoker 返回了 JSON，但没有 imageUrl / base64 / url。',
-        detail: JSON.stringify(data).slice(0, 500),
-      });
-    }
-
-    return res.json({
-      imageUrl,
-      base64,
-      model,
-      provider: 'custom',
-    });
-  }
-
-  const arrayBuffer = await imageResponse.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  let ext = 'png';
-
-  if (contentType.includes('jpeg') || contentType.includes('jpg')) {
-    ext = 'jpg';
-  }
-
-  if (contentType.includes('webp')) {
-    ext = 'webp';
-  }
-
-  const imageUrl = await saveImageBuffer(buffer, ext, req);
+  const imageUrl = createNiniRedirectUrl(url.toString(), req);
 
   return res.json({
     imageUrl,
-    model,
+    model: model || 'nai-diffusion-4-5-full',
     provider: 'custom',
+    mode: 'browser_redirect',
   });
 }
 
@@ -416,6 +388,11 @@ app.post('/api/novelai-generate', async (req, res) => {
       handle = '',
     } = req.body || {};
 
+    /**
+     * 重点：
+     * custom 必须在检查 NovelAI token 前分流。
+     * 否则 provider=custom 时也会报“缺少 NovelAI Token”。
+     */
     if (provider === 'custom') {
       return await generateWithNiniJoker(req, res, {
         prompt,
